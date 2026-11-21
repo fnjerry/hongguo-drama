@@ -29,7 +29,8 @@ function fixture(initialTasks) {
   const fakeClearTimeout = timer => { if (timer && 'cleared' in timer) timer.cleared = true; else clearTimeout(timer); };
   const context = vm.createContext({ require: n => n === 'electron'
     ? { app, ipcMain: { handle: (n, f) => handlers[n] = f }, protocol: { registerSchemesAsPrivileged() {} },
-      Menu: { buildFromTemplate: items => items, setApplicationMenu() {} } }
+      Menu: { buildFromTemplate: items => items, setApplicationMenu() {} },
+      session: { defaultSession: { setProxy: async () => {}, clearAuthCache: async () => {}, closeAllConnections: async () => {} } } }
     : n === 'axios' ? Object.assign((...args) => state.transportError ? Promise.reject(state.transportError) : req(n)(...args), req(n))
     : n === './src/native/hongguo' ? { fetchPlayUrlSingle: async (_vid, _sid, options) => { state.calls++; state.qualities.push(options.quality); return state.result; }, markWebMediaFailure() {} }
     : n === './src/store' ? { getSettings: () => settings, saveSettings: s => settings = s,
@@ -105,11 +106,11 @@ const checks = [
     h.fire();
     h.run(`requestMedia = async () => ({headers: {'content-length': '200000'}, data: testReadStream()});`);
     await h.download();
-    assert.equal(h.task().status, 'completed');
+    assert.equal(h.task().status, 'completed', h.task().error);
     const before = fs.readFileSync(h.task().savePath);
     h.run(`requestMedia = async () => { throw new Error('completed files must not be downloaded again'); };`);
     await h.download();
-    assert.equal(h.task().status, 'completed');
+    assert.equal(h.task().status, 'completed', h.task().error);
     assert.deepEqual(fs.readFileSync(h.task().savePath), before);
     for (const action of ['stop-download', 'pause-all']) {
       const g = fixture();

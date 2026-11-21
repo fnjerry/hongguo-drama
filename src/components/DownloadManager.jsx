@@ -71,6 +71,7 @@ function DownloadManager({ onNavigate, active = true }) {
   const [merging, setMerging] = useState(false);
   const [mergeError, setMergeError] = useState('');
   const [mergeTasks, setMergeTasks] = useState([]);
+  const [mergeDeleteSources, setMergeDeleteSources] = useState(false);
   const [confirmAsk, setConfirmAsk] = useState(null); // 删除确认（可勾选删除本地文件）
   const [mergeAsk, setMergeAsk] = useState(false);    // 合并格式选择
   const [page, setPage] = useState(1);
@@ -109,10 +110,10 @@ function DownloadManager({ onNavigate, active = true }) {
     };
   }, [active]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (verifyFiles = false) => {
     const request = ++requests.current.tasks;
     try {
-      const list = await window.electronAPI.getDownloadTasks();
+      const list = await window.electronAPI.getDownloadTasks({ verifyFiles });
       if (!activeRef.current || request !== requests.current.tasks) return;
       if (!Array.isArray(list)) throw new Error('下载任务读取失败，请重试');
       for (const task of list) if (task.status === 'completed' && task.hongguoInfo?.series_id) downloadedSeries.current.add(String(task.hongguoInfo.series_id));
@@ -151,6 +152,7 @@ function DownloadManager({ onNavigate, active = true }) {
     mergeDialogGenerationRef.current += 1;
     setMergeAsk(false);
     setMergeError('');
+    setMergeDeleteSources(false);
   }, [mergeSeriesId]);
 
   const loadMergeTasks = useCallback(async () => {
@@ -174,6 +176,12 @@ function DownloadManager({ onNavigate, active = true }) {
   useEffect(() => {
     if (!active) return;
     refresh();
+    let verifying = false;
+    const verifyTimer = setTimeout(async () => {
+      verifying = true;
+      try { await refresh(true); }
+      finally { verifying = false; }
+    }, 1000);
     loadQueue();
     loadSeriesList();
     loadMergeTasks();
@@ -230,21 +238,36 @@ function DownloadManager({ onNavigate, active = true }) {
       }),
       window.electronAPI.onMergeCompleted((data) => {
         loadMergeTasks();
-        showToast(data.storageWarning || ('合并完成：' + (data.path ? data.path.split(/[\\/]/).pop() : '')), data.storageWarning ? 'error' : 'success');
+        if (data.cleanedCount || data.cleanupWarning) {
+          refresh();
+          loadSeriesList();
+        }
+        const name = data.path ? data.path.split(/[\\/]/).pop() : '';
+        const warning = [data.cleanupWarning && `分集删除未完全成功：${data.cleanupWarning}`, data.storageWarning]
+          .filter(Boolean).join('；');
+        if (warning) showToast(`合并完成，但${warning}`, 'error');
+        else if (data.cleanedCount) showToast(`合并完成，已删除 ${data.cleanedCount} 个分集文件`, 'success');
+        else showToast('合并完成：' + name, 'success');
       }),
       window.electronAPI.onMergeFailed((data) => {
         loadMergeTasks();
         showToast('合并失败：' + (data.error || '未知错误'), 'error');
       }),
     ];
-    const timer = setInterval(() => {
-      loadQueue();
-      refresh();
-      loadMergeTasks();
+    let polling = false;
+    const timer = setInterval(async () => {
+      if (polling || verifying) return;
+      polling = true;
+      try {
+        await Promise.all([loadQueue(), refresh(), loadMergeTasks()]);
+      } finally {
+        polling = false;
+      }
     }, 15000);
     return () => {
       cleanups.forEach(cleanup => cleanup());
       clearInterval(timer);
+      clearTimeout(verifyTimer);
       clearTimeout(batchTimer);
       for (const key of Object.keys(requests.current)) requests.current[key]++;
     };
@@ -318,12 +341,15 @@ function DownloadManager({ onNavigate, active = true }) {
   const openMergeDialog = () => {
     mergeDialogGenerationRef.current += 1;
     setMergeError('');
+    setMergeDeleteSources(false);
     setMergeAsk(true);
   };
 
-  const closeMergeDialog = () => {
+  const closeMergeDialog = (force = false) => {
+    if (merging && !force) return;
     mergeDialogGenerationRef.current += 1;
     setMergeError('');
+    setMergeDeleteSources(false);
     setMergeAsk(false);
   };
 
@@ -338,22 +364,23 @@ function DownloadManager({ onNavigate, active = true }) {
     setMerging(true);
     setMergeError('');
     try {
-      const options = require1080 ? { compatible: false, require1080: true } : { compatible };
+      const options = { compatible, ...(require1080 ? { require1080: true } : {}), ...(mergeDeleteSources ? { deleteSources: true } : {}) };
       const res = await window.electronAPI.mergeSeries(mergeSeriesId, '', options);
       if (dialogGeneration !== mergeDialogGenerationRef.current) return;
       if (!res || !res.success) {
         setMergeError((res && res.error) || '合并失败');
         return;
       }
-      closeMergeDialog();
+      closeMergeDialog(true);
       await loadMergeTasks();
       const sizeGb = (res.totalBytes / 1073741824).toFixed(2);
       const duration = res.totalDuration > 0 ? ` / ${fmtElapsed(res.totalDuration)}` : ' / 时长待探测';
-      showToast(compatible
+      showToast((compatible
         ? `开始兼容格式合并 ${res.count} 集（H.264，耗时较长）`
         : require1080
         ? `开始高质量分辨率合并 ${res.count} 集`
-        : `开始合并 ${res.count} 集（约 ${sizeGb} GB${duration}）`);
+        : `开始合并 ${res.count} 集（约 ${sizeGb} GB${duration}）`)
+        + (mergeDeleteSources ? '；成功后删除已合并分集' : ''));
       if (res.codecWarning) showToast(res.codecWarning, 'error');
     } catch (e) {
       if (dialogGeneration === mergeDialogGenerationRef.current) setMergeError('合并异常: ' + e.message);
@@ -675,7 +702,7 @@ function DownloadManager({ onNavigate, active = true }) {
         <div className="dm-hint">{t("已选中 ")}<b>{t(retryableSelectedCount)}</b>{t(" 个失败项，点")}<b>{t("「重试选中」")}</b>{t(" 即会重新下载（无需重新解析）。")}</div>
       )}
 
-      {loadError && <div className="alert alert-error" role="alert">{t(loadError)}<button className="btn btn-outline btn-sm" onClick={refresh}>{t("重新加载")}</button></div>}
+      {loadError && <div className="alert alert-error" role="alert">{t(loadError)}<button className="btn btn-outline btn-sm" onClick={() => refresh(true)}>{t("重新加载")}</button></div>}
       {seriesOptions.length > 1 && (
         <div className="dm-series-filter">
           <label htmlFor="dm-series-select">{t("按剧集查看")}</label>
@@ -812,7 +839,7 @@ function DownloadManager({ onNavigate, active = true }) {
 
       {/* 合并格式选择 */}
       {mergeAsk && (
-        <div className="player-confirm-mask" onClick={closeMergeDialog}>
+        <div className="player-confirm-mask" onClick={() => closeMergeDialog()}>
           <div className="player-confirm" role="dialog" aria-modal="true" aria-label={t(confirmAsk ? confirmAsk.title : '合并导出')} tabIndex={-1} onClick={(e) => e.stopPropagation()}>
             <div className="player-confirm-title" style={{ color: 'var(--accent)' }}>
               <Layers size={17} />{t("合并整部剧")}</div>
@@ -822,11 +849,16 @@ function DownloadManager({ onNavigate, active = true }) {
               <p><b>{t("快速合并")}</b>{t("：优先无损拼接，保留每段原分辨率，部分设备可能不兼容。")}</p>
               <p><b>{t("兼容合并")}</b>{t("：必要时转为H.264/AAC，仍保留每段原分辨率，处理较慢。")}</p>
               <p>{t("三种方式都保留原文件，只合并已下载分集，不自动补齐，也不会把低清变成真高清。")}</p>
+              <label className="dm-confirm-check">
+                <input type="checkbox" checked={mergeDeleteSources} onChange={event => setMergeDeleteSources(event.target.checked)} />
+                <span>{t("合并成功后删除已合并分集")}</span>
+              </label>
+              <p>{t("开启后会永久删除本次已合并的分集视频和下载记录；合并失败、取消或输出未成功时不会删除。")}</p>
               {mergeError && <p className="alert-error" role="alert">{t(mergeError)}</p>}
             </div>
             <div className="player-confirm-foot">
               <button className="btn btn-outline" onClick={() => doMerge(false, true)} disabled={merging}>{t("高质量分辨率合并")}</button>
-              <button className="btn btn-outline" onClick={closeMergeDialog}>{t("取消")}</button>
+              <button className="btn btn-outline" onClick={() => closeMergeDialog()} disabled={merging}>{t("取消")}</button>
               <button className="btn btn-outline" onClick={() => doMerge(true)} disabled={merging}>{t("兼容合并（H.264）")}</button>
               <button className="btn btn-primary" onClick={() => doMerge(false)} disabled={merging}>{t("智能快速合并")}</button>
             </div>
@@ -840,7 +872,7 @@ function DownloadManager({ onNavigate, active = true }) {
           <div className="player-confirm" role="dialog" aria-modal="true" aria-label={t(confirmAsk ? confirmAsk.title : '合并导出')} tabIndex={-1} onClick={(e) => e.stopPropagation()}>
             <div className="player-confirm-title">
               <Trash2 size={17} />
-              {confirmAsk.title}
+              {t(confirmAsk.title)}
             </div>
             <div className="player-confirm-msg">
               <p>{t("共 ")}{t(confirmAsk.count)}{t(" 个任务，其中 ")}{t(confirmAsk.withFile)}{t(" 个已下载完成")}{t(confirmAsk.estBytes > 0 ? `（约 ${fmtSize(confirmAsk.estBytes)}）` : '')}。</p>

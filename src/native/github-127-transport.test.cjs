@@ -32,10 +32,10 @@ function load(transport) {
     return local('./app-source');
 }
 
-for (const target of ['registration', 'model', 'renewal', 'alternate', 'fallback', 'encryption-metadata']) {
+for (const target of ['registration', 'model', 'renewal', 'alternate', 'video-tab', 'fallback', 'encryption-metadata']) {
     test(`caller cancellation closes the real axios socket during ${target}`, { timeout: 3000 }, async () => {
         const stages = [];
-        let registrations = 0, models = 0, enter, closed;
+        let registrations = 0, enter, closed;
         const entered = new Promise(resolve => { enter = resolve; });
         const disconnected = new Promise(resolve => { closed = resolve; });
         const server = http.createServer((request, response) => {
@@ -46,7 +46,9 @@ for (const target of ['registration', 'model', 'renewal', 'alternate', 'fallback
                 enter();
                 return;
             }
-            const emptyFirstModel = ['renewal', 'alternate'].includes(target) && stage === 'model';
+            const emptyModel = target === 'renewal' && ['model', 'alternate', 'video-tab'].includes(stage)
+                || target === 'alternate' && stage === 'model'
+                || target === 'video-tab' && ['model', 'alternate'].includes(stage);
             let data = stage === 'registration' || stage === 'renewal'
                 ? { device_id: '123', install_id: '456' }
                 : { code: 0, data: { [vid]: { video_model: model(!['fallback', 'encryption-metadata'].includes(target)) } } };
@@ -54,13 +56,24 @@ for (const target of ['registration', 'model', 'renewal', 'alternate', 'fallback
                 data.data[vid].video_model = model();
                 delete data.data[vid].video_model.video_list[0].encrypt_info;
             }
-            response.end(emptyFirstModel ? '' : JSON.stringify(data));
+            response.end(emptyModel ? '' : JSON.stringify(data));
         });
         await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
         const api = load(config => {
             const url = new URL(config.url);
-            const stage = url.pathname.includes('device_register') ? (++registrations === 1 ? 'registration' : 'renewal')
-                : config.url === metadata ? target : (++models === 1 ? 'model' : 'alternate');
+            let stage;
+            if (url.pathname.includes('device_register')) stage = ++registrations === 1 ? 'registration' : 'renewal';
+            else if (config.url === metadata) stage = target;
+            else if (url.pathname === '/reading/bookapi/video_tab/multi_video_model/v1/') {
+                assert.equal(config.method, 'GET');
+                stage = 'video-tab';
+            }
+            else {
+                assert.equal(config.method, 'POST');
+                assert.equal(url.pathname, '/novel/player/multi_video_model/player/v1');
+                assert.ok(['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-sinfonlinea.fqnovel.com'].includes(url.hostname));
+                stage = url.hostname === 'api5-normal-sinfonlineb.fqnovel.com' ? 'model' : 'alternate';
+            }
             stages.push(stage);
             return axios({ ...config, url: `http://127.0.0.1:${server.address().port}/${stage}`, proxy: false });
         });
@@ -74,7 +87,11 @@ for (const target of ['registration', 'model', 'renewal', 'alternate', 'fallback
             assert.doesNotMatch(JSON.stringify(outcome.error) + outcome.error.stack, /PRIVATE_CANCEL_REASON/);
             await Promise.race([disconnected, delay(400).then(() => assert.fail('axios socket remained open'))]);
             assert.equal(stages.at(-1), target, 'cancellation must not trigger another registration or route');
-            assert.equal(stages.filter(stage => stage === 'alternate').length, target === 'alternate' ? 1 : 0);
+            const expectedStages = target === 'registration' ? ['registration'] : target === 'model'
+                ? ['registration', 'model'] : target === 'renewal'
+                    ? ['registration', 'model', 'alternate', 'video-tab', 'renewal'] : target === 'video-tab'
+                        ? ['registration', 'model', 'alternate', 'video-tab'] : ['registration', 'model', target];
+            assert.deepEqual(stages, expectedStages, 'each cancellation target must be reached through its actual route');
         } finally {
             server.closeAllConnections();
             await new Promise(resolve => server.close(resolve));
