@@ -123,9 +123,10 @@ function load(fetchPlayUrlSingle, overrides = {}) {
     response.data.destroy(); assert.equal(requests.at(-1).headers.referer, undefined);
   });
   await check('web: real provider switches cached failed episode to App for five minutes, isolates episodes and expires', async () => {
-    let now = Date.now(), webHits = 0, appHits = 0;
+    let now = Date.now(), webHits = 0, appHits = 0, appAvailable = false;
     const nativePath = path.resolve(__dirname, '../src/native/hongguo.js');
     const nativeRequire = createRequire(nativePath);
+    require('../src/native/source-order').setSourceOrder(['web', 'app', 'sdk', 'openhongguo']);
     const context = vm.createContext({ module: { exports: {} }, Buffer, URL, AbortController, process: { env: {} }, console,
       Date: class extends Date { static now() { return now; } },
       require: name => name === 'axios' ? { get: async url => {
@@ -136,17 +137,26 @@ function load(fetchPlayUrlSingle, overrides = {}) {
             publicVideoSeo: { available: true, itemId: vid, seriesId: '1' } },
         } })}</script><script type="application/ld+json">${JSON.stringify({ '@type': 'VideoObject', url: `https://hongguoduanju.com/player/1/${vid}`, contentUrl: 'https://media.example/web.mp4' })}</script>` };
       } }
-        : name === './app-source' ? { fetchAppPlayUrl: async () => { appHits++; return { url: 'https://media.example/app.mp4', source: 'app' }; } } : nativeRequire(name),
+        : name === './app-source' ? { fetchAppPlayUrl: async (_vid, options) => {
+          if (options?.allowV8 === false) throw new Error('SDK unavailable');
+          appHits++;
+          if (!appAvailable) throw new Error('App temporarily unavailable');
+          return { url: 'https://media.example/app.mp4', source: 'app' };
+        } }
+        : name === './openhongguo-source' ? { fetchPlayUrlSingle: async () => { throw new Error('openhongguo unavailable'); } }
+        : nativeRequire(name),
     });
     vm.runInContext(fs.readFileSync(nativePath, 'utf8'), context);
     const native = context.module.exports;
     const first = await native.fetchPlayUrlSingle('11', '1');
     assert.equal(first.source, 'web', JSON.stringify(first)); assert.equal(first.vid, '11');
+    appAvailable = true;
     const h = hload(native.fetchPlayUrlSingle, { './src/native/hongguo': native });
     await assert.rejects(h.context.requestMedia({ ...first, url: base + '/missing' }));
     assert.equal((await native.fetchPlayUrlSingle('11', '1')).source, 'app', 'failed cached URL must not be returned again');
     assert.equal((await native.fetchPlayUrlSingle('11', '1', { force: true })).source, 'app');
     assert.equal(webHits, 1); assert.equal(appHits, 2);
+    appAvailable = false;
     assert.equal((await native.fetchPlayUrlSingle('22', '1')).source, 'web');
     now += 5 * 60 * 1000 + 1;
     assert.equal((await native.fetchPlayUrlSingle('11', '1')).source, 'web');

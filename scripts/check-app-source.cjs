@@ -58,6 +58,18 @@ function fixture({ wrongVid = false, fallback = 'https://vod.snssdk.com/info', m
     assert.equal(config.responseType, 'text');
     const model = { video_model: JSON.stringify({ fallback_api: fallback }) };
     const modelResponse = { status: 200, headers: {}, data: JSON.stringify({ code: 0, data: { '999': model, ...(wrongVid ? {} : { '11': model }) } }) };
+    if (new URL(config.url).pathname === '/novel/player/multi_video_model/preload/v1') {
+      assert.equal(config.method, 'POST');
+      assert.equal(config.headers['Content-Encoding'], 'gzip');
+      assert.ok(config.headers['x-ss-stub']);
+      const payload = JSON.parse(zlib.gunzipSync(config.data));
+      assert.deepEqual(payload.mixed_video_id_map['1004'], ['11']);
+      assert.equal(payload.dr_scene, 'preload');
+      assert.equal(payload.biz_param.device_level, 2);
+      assertPlayerSignature(config);
+      if (redirect) return { status: 302, headers: { location: redirect }, data: '' };
+      return emptyCurrent ? { status: 200, headers: {}, data: '' } : modelResponse;
+    }
     if (new URL(config.url).pathname === '/novel/player/multi_video_model/player/v1') {
       assert.equal(config.method, 'POST');
       assert.equal(config.headers['Content-Encoding'], 'gzip');
@@ -72,7 +84,12 @@ function fixture({ wrongVid = false, fallback = 'https://vod.snssdk.com/info', m
     if (new URL(config.url).pathname === '/reading/bookapi/video_tab/multi_video_model/v1/') {
       assert.equal(config.method, 'GET');
       assert.equal(config.data, null);
-      return modelResponse;
+      return emptyCurrent ? { status: 200, headers: {}, data: '' } : modelResponse;
+    }
+    if (new URL(config.url).pathname === '/novel/player/video_model/v1/') {
+      assert.equal(config.method, 'POST');
+      assert.match(config.headers['User-Agent'], /^com\.phoenix\.read\/73932 /);
+      return emptyCurrent ? { status: 200, headers: {}, data: '' } : modelResponse;
     }
     if (config.method === 'POST') {
       assert.match(config.headers['User-Agent'], /^com\.phoenix\.read\/74332 /);
@@ -104,11 +121,13 @@ function fixture({ wrongVid = false, fallback = 'https://vod.snssdk.com/info', m
         const signed = require(path.join(nativeDir, 'playback-v5')).signPlaybackV5(input);
         signatures.push({ input, ...signed, v5: true }); return signed;
       } };
+      if (name === './sdk-playback') return { resolveSdkPlayback: async () => null };
       if (name === './playback-signature') return { signPlayer: input => {
         const headers = require(path.join(nativeDir, 'playback-signature')).signPlayer({ ...input, ...entropy });
         signatures.push({ input, headers }); return headers;
       } };
       if (name === './download-quality') return require(path.join(nativeDir, 'download-quality'));
+      if (name === './source-policy') return require(path.join(nativeDir, 'source-policy'));
       if (name === './request-signal') return require(path.join(nativeDir, 'request-signal'));
       if (name === 'node:zlib') return zlib;
       if (name === 'node:timers/promises') return require(name);
@@ -124,10 +143,12 @@ function fixture({ wrongVid = false, fallback = 'https://vod.snssdk.com/info', m
 }
 
 function nativeFixture() {
+  require(path.join(nativeDir, 'source-order')).setSourceOrder(['app', 'sdk', 'web', 'openhongguo']);
   const pending = [];
   const context = { module: { exports: {} }, Buffer, URL, AbortController, process: { env: {} },
     require: name => name === 'axios' ? { get: () => new Promise(resolve => pending.push(resolve)) }
       : name === './app-source' ? { fetchAppPlayUrl: async () => { throw new Error('Unexpected App lookup in Web cache fixture'); } }
+      : name === './openhongguo-source' ? { fetchPlayUrlSingle: async () => { throw new Error('fixture openhongguo unavailable'); } }
       : require(name.startsWith('.') ? path.join(nativeDir, name) : name),
   };
   vm.runInNewContext(fs.readFileSync(path.join(nativeDir, 'hongguo.js'), 'utf8') + '\nmodule.exports.parseModelVideo = parseModelVideo;', context);
@@ -147,7 +168,9 @@ const checks = [
     await f.fetch('11');
     await f.fetch('11');
     await Promise.all([f.fetch('11'), f.fetch('11'), f.fetch('11')]);
-    const requests = f.calls.filter(call => new URL(call.url).pathname === '/novel/player/multi_video_model/player/v1');
+    const requests = f.calls.filter(call => ['/novel/player/multi_video_model/preload/v1',
+      '/novel/player/multi_video_model/player/v1',
+      '/reading/bookapi/video_tab/multi_video_model/v1/'].includes(new URL(call.url).pathname));
     assert.equal(requests.length, 5, 'one model request per lookup; no retry loop');
     for (const field of ['iid', 'device_id']) {
       const ids = requests.map(call => new URL(call.url).searchParams.get(field));
@@ -160,9 +183,10 @@ const checks = [
     assert.match(cdids[0], /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i);
     assert.equal(f.calls.length, 10, 'each lookup retains its two-stage flow');
     const emptyV5 = fixture({ emptyCurrent: true });
-    await emptyV5.fetch('11');
-    assert.equal(emptyV5.calls.length, 4, 'empty v5 responses recover through video_tab and its verified metadata');
-    assert.deepEqual(emptyV5.calls.map(call => call.method || 'GET'), ['POST', 'POST', 'GET', 'GET']);
+    await assert.rejects(emptyV5.fetch('11'));
+    assert.equal(emptyV5.calls.length, 10, 'empty V5 responses stay bounded before failing closed');
+    assert.deepEqual(emptyV5.calls.map(call => call.method || 'GET'),
+      ['POST', 'POST', 'POST', 'GET', 'GET', 'POST', 'POST', 'POST', 'POST', 'POST']);
   }],
   ['App H264 takes priority over higher-resolution HEVC', async () => {
     const result = await appRows({ hd: { main_url: mediaUrl('hevc'), codec_type: 'hevc', quality_desc: '1080P' },
@@ -261,7 +285,7 @@ const checks = [
     }
     const { fetch, calls } = fixture({ redirect: 'https://127.0.0.1/private' });
     await assert.rejects(fetch('11'));
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     await assert.rejects(fixture({ media: 'https://127.0.0.1/video' }).fetch('11'));
   }],
   ['invalid input and invalid key rejected', async () => {

@@ -14,7 +14,8 @@ const WEB_QUERY = {
 function safeMessage(error, fallback = '账号操作失败，请稍后重试') {
   return String(error?.message || fallback)
     .replace(/https?:\/\/\S+/gi, '[地址]')
-    .replace(/(?:sessionid|sid_tt|passport_csrf_token)=[^;\s]+/gi, '$1=[已隐藏]')
+    .replace(/(?:sessionid_ss|sessionid|sid_tt|sid_guard|uid_tt_ss|uid_tt|odin_tt|passport_csrf_token)=[^;\s]+/gi, '$1=[已隐藏]')
+    .replace(/(?:cookie|authorization)\s*:\s*[^\r\n]+/gi, '[已隐藏]')
     .slice(0, 160);
 }
 
@@ -61,8 +62,57 @@ function responseData(payload) {
   return payload.data;
 }
 
-function parseQr(payload) {
+/**
+ * 解析官方「我的 → 收藏」返回的剧集书架。
+ *
+ * 接口 `/reading/bookapi/bookshelf/video/info/v1/` 返回 `data.video_shelf_info` 数组，
+ * 每项里真正的剧集信息放在 `video_data` 里，外层另带收藏时间、简介与标签。
+ * 字段名在不同版本间有出入，这里按「外层优先、内层兜底」的顺序逐个尝试。
+ */
+function parseFavorites(payload) {
   const data = responseData(payload);
+  // 空书架时官方给的是 null；有条目时是数组。两者含义不同，不能混为一谈。
+  if (!Object.prototype.hasOwnProperty.call(data, 'video_shelf_info')) {
+    throw new Error('官方收藏数据格式已变化');
+  }
+  const rows = data.video_shelf_info == null ? [] : data.video_shelf_info;
+  if (!Array.isArray(rows)) throw new Error('官方收藏数据格式已变化');
+  const pick = (source, keys) => {
+    for (const key of keys) {
+      const value = source?.[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
+    return '';
+  };
+  const parsed = rows.map(row => {
+    const video = row?.video_data && typeof row.video_data === 'object' ? row.video_data : row;
+    const seriesId = pick(video, ['series_id']) || pick(row, ['series_id', 'book_id']);
+    const title = pick(row, ['series_title']) || pick(video, ['title']) || pick(row, ['book_name']);
+    if (!/^\d{1,30}$/.test(seriesId) || !title) return null;
+    const cover = cleanCover(pick(row, ['series_cover_url']) || pick(video, ['cover', 'cover_url', 'thumb_url']) || pick(row, ['thumb_url']));
+    const rawCount = Number(video?.episode_cnt ?? video?.episode_count ?? row?.episode_cnt ?? 0);
+    const intro = cleanText(pick(row, ['series_intro']) || pick(video, ['video_desc']) || pick(row, ['abstract']));
+    const stamp = Number(row?.collect_time ?? 0);
+    return {
+      series_id: seriesId,
+      series_title: title,
+      cover,
+      intro,
+      total: Number.isFinite(rawCount) && rawCount > 0 ? Math.floor(rawCount) : 0,
+      // collect_time 有秒和毫秒两种口径：10 位以内是秒，更长的是毫秒，统一成毫秒。
+      collectedAt: stamp > 0 && stamp < 10_000_000_000 ? stamp * 1000 : stamp,
+      account: true,
+    };
+  }).filter(Boolean)
+    .sort((a, b) => b.collectedAt - a.collectedAt)
+    .filter((row, index, list) => list.findIndex(item => item.series_id === row.series_id) === index);
+  // 有条目却一条都解析不出来，多半是官方改了字段，需要如实报错而不是显示空列表。
+  if (rows.length > 0 && parsed.length === 0) throw new Error('官方收藏条目格式已变化');
+  return parsed;
+}
+
+function parseQr(payload) {  const data = responseData(payload);
   const token = String(data.token || '').trim();
   const source = String(data.qrcode || '').trim();
   if (!token || !source) throw new Error('红果登录二维码格式已变化');
@@ -174,12 +224,17 @@ function secureSessionStore({ filePath, safeStorage }) {
     save(credentials) {
       if (!encryptionAvailable()) throw new Error('系统安全存储不可用，本次登录只保留到应用退出');
       const encrypted = safeStorage.encryptString(JSON.stringify(credentials));
-      const temporary = `${filePath}.tmp`;
+      const temporary = `${filePath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       const fd = fs.openSync(temporary, 'w', 0o600);
       try { fs.writeFileSync(fd, encrypted); fs.fsyncSync(fd); }
       finally { fs.closeSync(fd); }
-      fs.renameSync(temporary, filePath);
+      try {
+        fs.renameSync(temporary, filePath);
+      } catch (error) {
+        try { fs.unlinkSync(temporary); } catch {}
+        throw error;
+      }
       try { fs.chmodSync(filePath, 0o600); } catch {}
     },
     load() {
@@ -251,6 +306,8 @@ function createAccountService({
           if (!/会话过期|登录态未通过|账号编号无效|HTTP\s*(?:401|403)/i.test(message)) return;
           credentials = null;
           profile = null;
+          history = [];
+          historyLoaded = false;
           restorePromise = Promise.resolve(publicAccount());
           try { sessionStore.clear(); } catch {}
           onAccountExpired();
@@ -314,6 +371,9 @@ function createAccountService({
     },
 
     async completeWebLogin(cookie) {
+      if (typeof cookie !== 'string' || !cookie.trim() || cookie.length > 32768 || /[\r\n\0]/.test(cookie)) {
+        throw new Error('登录态无效，请重新登录');
+      }
       const attempt = ++loginGeneration;
       login = null;
       const token = generation;
@@ -340,6 +400,7 @@ function createAccountService({
 
     async pollLogin(loginId) {
       if (!login || login.id !== loginId) throw new Error('扫码会话已失效，请重新获取二维码');
+      if (login.polling) return login.polling;
       if (now() >= login.expiresAt) {
         login = null;
         return { success: true, status: 'expired' };
@@ -347,38 +408,43 @@ function createAccountService({
       const currentLogin = login;
       const attempt = loginGeneration;
       const stillCurrent = () => login === currentLogin && attempt === loginGeneration;
-      const data = responseData(await webJson('/passport/web/check_qrconnect/', {
-        next: `${WEB_BASE}/`, token: login.token,
-      }, login.jar));
-      if (!stillCurrent()) return { success: true, status: 'cancelled' };
-      console.log('[Account] QR status:', String(data.status || ''), data.redirect_url ? 'redirect' : 'no-redirect');
-      if (['5', 'expired'].includes(String(data.status))) {
-        login = null;
-        return { success: true, status: 'expired' };
-      }
-      if (!['3', 'confirmed'].includes(String(data.status))) return { success: true, status: 'pending' };
-      if (data.redirect_url) await finishRedirect(String(data.redirect_url), login.jar);
-      if (!stillCurrent()) return { success: true, status: 'cancelled' };
-      console.log('[Account] Login session cookie:', login.jar.hasSession() ? 'present' : 'missing');
-      if (!login.jar.hasSession()) return { success: true, status: 'pending' };
+      const run = (async () => {
+        const data = responseData(await webJson('/passport/web/check_qrconnect/', {
+          next: `${WEB_BASE}/`, token: currentLogin.token,
+        }, currentLogin.jar));
+        if (!stillCurrent()) return { success: true, status: 'cancelled' };
+        console.log('[Account] QR status:', String(data.status || ''), data.redirect_url ? 'redirect' : 'no-redirect');
+        if (['5', 'expired'].includes(String(data.status))) {
+          login = null;
+          return { success: true, status: 'expired' };
+        }
+        if (!['3', 'confirmed'].includes(String(data.status))) return { success: true, status: 'pending' };
+        if (data.redirect_url) await finishRedirect(String(data.redirect_url), currentLogin.jar);
+        if (!stillCurrent()) return { success: true, status: 'cancelled' };
+        console.log('[Account] Login session cookie:', currentLogin.jar.hasSession() ? 'present' : 'missing');
+        if (!currentLogin.jar.hasSession()) return { success: true, status: 'pending' };
 
-      const cookie = login.jar.header();
-      console.log('[Account] Profile verify: start');
-      const nextProfile = await withTimeout(verify({ cookie }), 15000, '账号资料验证超时，请重试');
-      if (!stillCurrent()) return { success: true, status: 'cancelled' };
-      console.log('[Account] Profile verify: done');
-      const nextCredentials = { cookie };
-      let storageWarning = '';
-      try { sessionStore.save({ ...nextCredentials, profile: nextProfile }); }
-      catch (error) { storageWarning = safeMessage(error); }
-      credentials = nextCredentials;
-      profile = nextProfile;
-      history = [];
-      historyLoaded = false;
-      generation++;
-      login = null;
-      restorePromise = Promise.resolve(publicAccount());
-      return publicAccount({ storageWarning, status: 'signed-in' });
+        const cookie = currentLogin.jar.header();
+        console.log('[Account] Profile verify: start');
+        const nextProfile = await withTimeout(verify({ cookie }), 15000, '账号资料验证超时，请重试');
+        if (!stillCurrent()) return { success: true, status: 'cancelled' };
+        console.log('[Account] Profile verify: done');
+        const nextCredentials = { cookie };
+        let storageWarning = '';
+        try { sessionStore.save({ ...nextCredentials, profile: nextProfile }); }
+        catch (error) { storageWarning = safeMessage(error); }
+        credentials = nextCredentials;
+        profile = nextProfile;
+        history = [];
+        historyLoaded = false;
+        generation++;
+        login = null;
+        restorePromise = Promise.resolve(publicAccount());
+        return publicAccount({ storageWarning, status: 'signed-in' });
+      })();
+      currentLogin.polling = run;
+      try { return await run; }
+      finally { if (currentLogin.polling === run) currentLogin.polling = null; }
     },
 
     cancelLogin(loginId) {
@@ -426,6 +492,16 @@ function createAccountService({
       return publicAccount({ results: history.map(row => ({ ...row })) });
     },
 
+    /** 官方「我的 → 收藏」里的剧集书架（云端，不是本机收藏）。 */
+    async favorites() {
+      const current = credentials;
+      if (!current || !profile) return { success: true, signedIn: false, account: null, results: [] };
+      const token = generation;
+      const rows = parseFavorites(await accountJson(current, '/reading/bookapi/bookshelf/video/info/v1/'));
+      if (token !== generation) return { success: true, signedIn: false, account: null, results: [] };
+      return publicAccount({ results: rows.map(row => ({ ...row })) });
+    },
+
     row(seriesId) {
       return history.find(row => row.series_id === String(seriesId)) || null;
     },
@@ -433,5 +509,5 @@ function createAccountService({
 }
 
 module.exports = {
-  createAccountService, secureSessionStore, parseQr, parsePassportProfile, parseHistory, safeMessage,
+  createAccountService, secureSessionStore, parseQr, parsePassportProfile, parseHistory, parseFavorites, safeMessage,
 };

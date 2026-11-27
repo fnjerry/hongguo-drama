@@ -13,10 +13,20 @@ function appRoute(config) {
     assert.equal(url.hostname, 'log5-applog-lf.fqnovel.com');
     return 'registration';
   }
+  if (url.pathname === '/novel/player/multi_video_model/preload/v1') {
+    assert.equal(config.method, 'POST');
+    assert.equal(url.hostname, 'reading.snssdk.com');
+    return 'model';
+  }
   if (url.pathname === '/novel/player/multi_video_model/player/v1') {
     assert.equal(config.method, 'POST');
     assert.ok(['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-sinfonlinea.fqnovel.com'].includes(url.hostname));
     return 'model';
+  }
+  if (url.pathname === '/reading/bookapi/video_tab/multi_video_model/v1/') {
+    assert.equal(config.method, 'GET');
+    assert.equal(url.hostname, 'api5-normal-sinfonlineb.fqnovel.com');
+    return 'videoTab';
   }
   if (url.pathname === '/novel/player/multi_video_model/v1/') {
     assert.equal(config.method, 'POST');
@@ -32,9 +42,24 @@ const webPage = (vid = '11', sid = '1', extra = {}) => `<script>window._ROUTER_D
     publicVideoSeo: { available: true, itemId: vid, seriesId: sid }, ...extra },
 } })}</script><script type="application/ld+json">${JSON.stringify({ '@type': 'VideoObject', url: `https://hongguoduanju.com/player/${sid}/${vid}`, contentUrl: media('web') })}</script>`;
 function load(file, dependencies) {
-  dependencies = { './playback-device': { registerPlaybackDevice: async () => playbackDevice }, ...dependencies };
+  dependencies = {
+    './playback-device': { registerPlaybackDevice: async () => playbackDevice },
+    './openhongguo-source': {
+      fetchEpisodeList: async () => { throw new Error('openhongguo unavailable'); },
+      fetchPlayUrlSingle: async () => { throw new Error('openhongguo unavailable'); },
+    },
+    ...(file === 'hongguo.js' ? {
+      './app-source': {
+        fetchAppEpisodeList: async () => { throw Object.assign(new Error('app detail unavailable'), { code: 'EMPTY_RESPONSE' }); },
+        fetchAppPlayUrl: async () => { throw new Error('app unavailable'); },
+      },
+    } : {}),
+    ...dependencies,
+  };
   const context = { Buffer, URL, URLSearchParams, AbortSignal, AbortController, process: { env: {} }, module: { exports: {} },
-    console: { warn() {} }, setTimeout: (fn, ms) => ms === 600 ? setTimeout(fn, 0) : fn(),
+    console: { warn() {} },
+    setTimeout: (fn, ms) => { if (ms === 600) { const timer = setTimeout(fn, 0); return { _timer: timer }; } return fn(); },
+    clearTimeout: (timer) => clearTimeout(timer?._timer ?? timer),
     require: name => Object.hasOwn(dependencies, name) ? dependencies[name] : require(name.startsWith('.') ? path.join(nativeDir, name) : name) };
   vm.runInNewContext(fs.readFileSync(path.join(nativeDir, file), 'utf8'), context);
   return context.module.exports;
@@ -54,28 +79,45 @@ function appFixture(rows) {
     calls.push(config);
     const route = appRoute(config);
     let data;
-    if (route === 'registration') data = { device_id: playbackDevice.device_id, install_id: playbackDevice.iid };
+    if (route === 'videoTab') data = '';
+    else if (route === 'registration') data = { device_id: playbackDevice.device_id, install_id: playbackDevice.iid };
     else if (route === 'model' || route === 'legacy') {
       for (const key of ['device_id', 'iid', 'cdid']) assert.equal(new URL(config.url).searchParams.get(key), playbackDevice[key]);
       data = { data: { '11': { video_model: { fallback_api: 'https://vod.snssdk.com/info' } } } };
     } else data = { video_info: { data: { video_list: rows } } };
-    return { status: 200, headers: {}, data: JSON.stringify(data) };
+    return { status: 200, headers: {}, data: typeof data === 'string' ? data : JSON.stringify(data) };
   } });
   return { ...app, calls };
 }
 function routeFixture() {
-  const state = { web: true, app: false, calls: [] };
+  const state = { web: true, app: false, openhongguo: false, calls: [], sdkPriority: null };
   const native = load('hongguo.js', {
     axios: {
       get: async url => { state.calls.push('web'); return { data: state.web && url.endsWith('/11') ? webPage() : '' }; },
       post: async () => { state.calls.push('api'); return { status: 200, headers: {}, data: Buffer.alloc(0) }; },
     },
-    './app-source': { fetchAppPlayUrl: async () => { state.calls.push('app'); if (!state.app) throw new Error('secret https://signed.invalid/?token=private'); return { url: media('app'), source: 'app' }; } },
+    './app-source': { fetchAppPlayUrl: async (_vid, options) => {
+      state.calls.push(options?.allowV8 === false ? 'sdk' : 'app');
+      if (options?.allowV8 === false) state.sdkPriority = options.sdkPriority;
+      if (!state.app) throw new Error('secret https://signed.invalid/?token=private');
+      return { url: media('app'), source: 'app' };
+    } },
+    './openhongguo-source': { fetchPlayUrlSingle: async () => {
+      state.calls.push('openhongguo');
+      if (!state.openhongguo) throw new Error('unavailable');
+      return { url: media('openhongguo'), source: 'openhongguo' };
+    } },
   });
   return { ...native, state };
 }
+async function withSourceOrder(value, run) {
+  const sourceOrder = require('../src/native/source-order');
+  const previous = sourceOrder.getSourceOrder();
+  sourceOrder.setSourceOrder(value);
+  try { return await run(); } finally { sourceOrder.setSourceOrder(previous); }
+}
 const checks = [
-  ['Missing explicit quality remains distinct from incompatible automatic sources without leaking raw messages', async () => {
+  ['Missing explicit quality remains distinct from incompatible automatic sources without leaking raw messages', () => withSourceOrder(['app', 'sdk', 'web', 'openhongguo'], async () => {
     for (const quality of ['720p', '1080p']) {
       const app = appFixture({ low: { main_url: media('low'), codec_type: 'h264', width: 360, height: 640 } });
       const f = load('hongguo.js', { './app-source': app });
@@ -99,8 +141,8 @@ const checks = [
       assert.equal(result.sources[0].code, code);
       assert.doesNotMatch(JSON.stringify(result), /secret|signed\.invalid|private/);
     }
-  }],
-  ['Registration failures retain safe details and remain retryable only for transient causes', async () => {
+  })],
+  ['Registration failures retain safe details and remain retryable only for transient causes', () => withSourceOrder(['app', 'sdk', 'web', 'openhongguo'], async () => {
     for (const [failure, expected, detail] of [
       [{ code: 'ECONNRESET' }, 'NETWORK_ERROR', '连接失败'],
       [{ code: 'ETIMEDOUT' }, 'TIMEOUT', '请求超时'],
@@ -139,13 +181,13 @@ const checks = [
       assert.equal(result.sources[0].message, '匿名播放设备注册失败；本机冷却 10 秒后可手动重试，上游何时恢复暂无法确认');
       assert.doesNotMatch(JSON.stringify(result), /secret|function|\[object/);
     }
-  }],
-  ['App network failures retain only safe codes and aggregate into distinct reasons', async () => {
+  })],
+  ['App network failures retain only safe codes and aggregate into distinct reasons', () => withSourceOrder(['app', 'sdk', 'web', 'openhongguo'], async () => {
     for (const [code, expected] of [['ECONNABORTED', 'TIMEOUT'], ['ETIMEDOUT', 'TIMEOUT'],
       ['ENOTFOUND', 'NETWORK_ERROR'], ['ECONNRESET', 'NETWORK_ERROR'], ['ERR_NETWORK', 'NETWORK_ERROR'],
       ['secret-token-code', 'NETWORK_ERROR']]) {
       const app = load('app-source.js', { axios: async config => {
-        assert.ok(['model', 'legacy'].includes(appRoute(config)));
+        assert.ok(['videoTab', 'model', 'legacy'].includes(appRoute(config)));
         throw Object.assign(new Error('secret https://signed.invalid/?token=private'), { code, config: { secret: true } });
       } });
       await assert.rejects(app.fetchAppPlayUrl('11'), error => {
@@ -158,8 +200,8 @@ const checks = [
       assert.equal(result.sources[0].code, expected);
       assert.doesNotMatch(JSON.stringify(result), /secret|signed\.invalid|private/);
     }
-  }],
-  ['App distinguishes HTTP, business refusal, absent model, parsing and unsafe media', async () => {
+  })],
+  ['App distinguishes HTTP, business refusal, absent model, parsing and unsafe media', () => withSourceOrder(['app', 'sdk', 'web', 'openhongguo'], async () => {
     const first = { data: { '11': { video_model: { fallback_api: 'https://vod.snssdk.com/info' } } } };
     const cases = [
       [{ status: 403 }, null, 'HTTP_403'],
@@ -176,7 +218,8 @@ const checks = [
         const route = appRoute(config);
         stages.push(route);
         assert.notEqual(route, 'registration', 'registration is isolated from model failures');
-        const result = { status: 200, headers: {}, ...(route === 'model' || route === 'legacy' ? response : { data: second }) };
+        const result = { status: 200, headers: {},
+          ...(route === 'videoTab' ? { data: '' } : route === 'model' || route === 'legacy' ? response : { data: second }) };
         if (typeof result.data !== 'string') result.data = JSON.stringify(result.data);
         return result;
       } });
@@ -184,9 +227,10 @@ const checks = [
       const result = await f.fetchPlayUrlSingle('11', '1', { quality: '720p' });
       assert.equal(result.sources[0].code, expected);
       assert.doesNotMatch(JSON.stringify(result), /secret|127\.0\.0\.1|private/);
-      assert.deepEqual(stages, second === null ? ['model'] : ['model', 'metadata'], 'explicit failures must not start another model route');
+      assert.deepEqual(stages.filter(stage => stage !== 'videoTab'),
+        second === null ? ['model'] : ['model', 'metadata'], 'explicit failures must not start another model route');
     }
-  }],
+  })],
   ['Web keeps null compatibility but reports actual failures on first and final fallback', async () => {
     for (const [failure, expected] of [
       [Object.assign(new Error('secret URL'), { response: { status: 404 } }), 'HTTP_404'],
@@ -230,7 +274,7 @@ const checks = [
       } },
     });
     assert.equal((await f.fetchPlayUrlSingle('11', '1')).source, 'app');
-    assert.deepEqual(webTimeouts, [4000, 4000], 'Web cannot consume the whole lookup deadline');
+    assert.deepEqual(webTimeouts, [], 'App-first lookup must not spend the Web timeout budget');
     assert.deepEqual(apiTimeouts, []);
     appAvailable = false; webTimeouts.length = 0;
     assert.equal((await f.fetchPlayUrlSingle('11', '1', { force: true })).code, 'SOURCE_UNAVAILABLE');
@@ -280,6 +324,10 @@ const checks = [
   ['Episode list turns repeated aborts and empty responses into one readable failure', async () => {
     let apiCalls = 0;
     const f = load('hongguo.js', {
+      './openhongguo-source': {
+        fetchEpisodeList: async () => { throw Object.assign(new Error('secret https://signed.invalid aborted'), { code: 'ERR_CANCELED' }); },
+        fetchPlayUrlSingle: async () => { throw new Error('openhongguo unavailable'); },
+      },
       axios: {
         get: async () => { throw Object.assign(new Error('aborted'), { code: 'ECONNRESET' }); },
         post: async () => { apiCalls++; return { status: 200, headers: {}, data: Buffer.alloc(0) }; },
@@ -288,12 +336,167 @@ const checks = [
     await assert.rejects(f.fetchEpisodeList('918273646'), error => {
       assert.match(error.message, /加载超时或连接中断/);
       assert.match(error.message, /0 字节/);
-      assert.doesNotMatch(error.message, /aborted/);
+      assert.doesNotMatch(error.message, /aborted|secret|signed\.invalid/);
       return true;
     });
     assert.equal(apiCalls, 1, 'empty 200 responses must stop without retrying');
   }],
-  ['Protected website SEO preview never replaces the complete App episode', async () => {
+  ['Episode list prefers openhongguo full batch, rejects incomplete web preview and bounds SDK timeout', async () => {
+    const sid = '918273647';
+    let sdkCalls = 0, webCalls = 0, apiCalls = 0;
+    const sdkFirst = load('hongguo.js', {
+      './openhongguo-source': {
+        fetchEpisodeList: async (id, opts) => {
+          sdkCalls++;
+          assert.equal(id, sid);
+          assert.ok(opts?.signal instanceof AbortSignal, 'openhongguo list must receive a bounded abort signal');
+          return { series_id: sid, series_title: '完整剧', total: 6, episodes: Array.from({ length: 6 }, (_, i) => ({ vid: String(100 + i), vid_index: i + 1 })), source: 'openhongguo' };
+        },
+        fetchPlayUrlSingle: async () => { throw new Error('openhongguo unavailable'); },
+      },
+      axios: {
+        get: async () => { webCalls++; return { data: '' }; },
+        post: async () => { apiCalls++; return { status: 200, headers: {}, data: Buffer.alloc(0) }; },
+      },
+    });
+    const full = await sdkFirst.fetchEpisodeList(sid);
+    assert.equal(full.source, 'openhongguo');
+    assert.equal(full.total, 6);
+    assert.equal(sdkCalls, 1);
+    assert.equal(webCalls, 0);
+    assert.equal(apiCalls, 0);
+
+    const previewHtml = `<script>window._ROUTER_DATA=${JSON.stringify({ loaderData: {
+      'player_(series_id)/page': { isSuccess: true, series_id: sid, seriesDetail: {
+        series_id: sid, series_name: '预览剧', episode_cnt: 71, accessible_episode_cnt: 3, vid_list: ['101', '102', '103'],
+      } },
+    } })}</script>`;
+    let detailCalls = 0;
+    const previewFallback = load('hongguo.js', {
+      axios: {
+        get: async () => ({ data: previewHtml }),
+        post: async () => {
+          detailCalls++;
+          return { status: 200, headers: {}, data: Buffer.from(JSON.stringify({ code: 0, data: {
+            [sid]: { video_data: { series_title: '完整回退', video_list: Array.from({ length: 71 }, (_, i) => ({ vid: String(200 + i), vid_index: i + 1 })) } },
+          } })) };
+        },
+      },
+    });
+    const parsedPreview = await previewFallback.fetchEpisodeListFromWeb(sid);
+    assert.equal(parsedPreview.episode_count, 71);
+    assert.equal(parsedPreview.complete, false);
+    const recovered = await previewFallback.fetchEpisodeList(sid);
+    assert.equal(recovered.total, 71);
+    assert.equal(detailCalls, 1, 'incomplete web preview must not be accepted as a full series');
+
+    let timedOutSignal = false, webBudgetOk = false;
+    const deadline = Date.now() + 300;
+    const bounded = load('hongguo.js', {
+      './openhongguo-source': {
+        fetchEpisodeList: async (_id, opts) => new Promise((_resolve, reject) => {
+          opts.signal.addEventListener('abort', () => { timedOutSignal = true; reject(new Error('aborted')); }, { once: true });
+        }),
+        fetchPlayUrlSingle: async () => { throw new Error('openhongguo unavailable'); },
+      },
+      axios: {
+        get: async () => {
+          webBudgetOk = deadline - Date.now() > 0;
+          return { data: `<script>window._ROUTER_DATA=${JSON.stringify({ loaderData: {
+            'player_(series_id)/page': { isSuccess: true, series_id: sid, seriesDetail: {
+              series_id: sid, series_name: '完整网页剧', episode_cnt: 2, vid_list: ['301', '302'],
+            } },
+          } })}</script>` };
+        },
+        post: async () => ({ status: 200, headers: {}, data: Buffer.alloc(0) }),
+      },
+    });
+    const keepAlive = setInterval(() => {}, 50);
+    try {
+      const fromWeb = await bounded.fetchEpisodeList(sid, { deadline, force: true });
+      assert.equal(timedOutSignal, true, 'stalled openhongguo list must abort before outer deadline');
+      assert.equal(webBudgetOk, true, 'web fallback must retain positive remaining deadline');
+      assert.equal(fromWeb.total, 2);
+    } finally { clearInterval(keepAlive); }
+  }],
+  ['Episode list falls back to signed App video_detail/v1 preserving 64-bit series_id and full numeric vids', async () => {
+    const sid = '7706908220253555737';
+    let detailCalled = 0, webCalled = 0;
+    const app = load('app-source.js', {
+      axios: async config => {
+        detailCalled++;
+        const url = new URL(config.url);
+        assert.equal(url.pathname, '/novel/player/video_detail/v1/');
+        assert.equal(config.method, 'POST');
+        assert.ok(config.headers['x-medusa'] && config.headers['x-helios'] && config.headers['x-khronos']);
+        const raw = `{"code":0,"data":{"video_data":{"series_id":${sid},"series_title":"完整真剧","series_cover":"https://img.example/c.jpg","series_intro":"简介","episode_cnt":3,"content_type":1001,"video_list":[{"vid":7706910230088518718,"vid_index":1,"title":"第1集"},{"vid":7706910230088518719,"vid_index":2,"title":"第2集"},{"vid":7706910230088518720,"vid_index":3,"title":"第3集","disable_play":true}]}}}`;
+        return { status: 200, headers: {}, data: raw };
+      },
+    });
+    const f = load('hongguo.js', {
+      './app-source': app,
+      axios: { get: async () => { webCalled++; return { data: '' }; }, post: async () => ({ status: 200, headers: {}, data: Buffer.alloc(0) }) },
+    });
+    const result = await f.fetchEpisodeList(sid);
+    assert.equal(detailCalled, 1);
+    assert.equal(webCalled, 0);
+    assert.equal(result.source, 'app');
+    assert.equal(result.series_id, sid);
+    assert.equal(result.content_type, '1001');
+    assert.equal(result.total, 3);
+    assert.deepEqual(Array.from(result.episodes, e => e.vid), ['7706910230088518718', '7706910230088518719', '7706910230088518720']);
+    assert.deepEqual(Array.from(result.episodes, e => e.locked), [false, false, true]);
+  }],
+  ['Web public fallback maps numeric vid to v1_ token via cached episode index when numeric fallback is unavailable', async () => {
+    const sid = '7690112243203050521', vid1 = '7690125606729550872', vid3 = '7690125616825256984';
+    const token1 = 'v1_invniDx7dcZhofRa2PNnTxWThlE', token3 = 'v1_BkUI5CKWjPF9YEPfGC637Xc5xsg';
+    const playerHtml = `<script>window._ROUTER_DATA=${JSON.stringify({ loaderData: {
+      'player_(series_id)/page': { isSuccess: true, series_id: sid, seriesDetail: {
+        series_id: sid, series_name: '测试剧', episode_cnt: 100, vid_list: [token1, 'v1_FjeBprkuoqDaLWspFe7ylPPWIJw', token3],
+      } },
+    } })}</script>`;
+    const fallbackCalls = [];
+    let htmlCalls = 0;
+    const axiosMock = Object.assign(async config => {
+      if (config.url.includes('/fallback-play-info')) {
+        fallbackCalls.push(config.data?.item_id);
+        if (config.data?.item_id === token1) return { status: 200, data: { main_url: media('web-v1-ep1'), url_expire: Math.floor(Date.now() / 1000) + 3600 } };
+        if (config.data?.item_id === token3) return { status: 200, data: { main_url: media('web-v1-ep3'), url_expire: Math.floor(Date.now() / 1000) + 3600 } };
+        return { status: 400, data: { error: 'public_fallback_unavailable' } };
+      }
+      throw new Error('unexpected axios call');
+    }, {
+      get: async url => {
+        if (url === `https://hongguoduanju.com/player/${sid}`) { htmlCalls++; return { data: playerHtml }; }
+        return { data: '' };
+      },
+      post: async () => ({ status: 200, headers: {}, data: Buffer.alloc(0) }),
+    });
+    const f = load('hongguo.js', {
+      axios: axiosMock,
+      './openhongguo-source': {
+        fetchEpisodeList: async () => ({
+          series_id: sid, series_title: '测试剧', total: 3, source: 'openhongguo',
+          episodes: [
+            { vid: vid1, vid_index: 1 },
+            { vid: '7690125606729550873', vid_index: 2 },
+            { vid: vid3, vid_index: 3 },
+          ],
+        }),
+        fetchPlayUrlSingle: async () => { throw new Error('unavailable'); },
+      },
+    });
+    await f.fetchEpisodeList(sid);
+    const r1 = await f.fetchPlayUrlFromWeb(vid1, sid);
+    const r3 = await f.fetchPlayUrlFromWeb(vid3, sid);
+    assert.equal(r1?.url, media('web-v1-ep1'));
+    assert.equal(r1?.vid, vid1);
+    assert.equal(r3?.url, media('web-v1-ep3'));
+    assert.equal(r3?.vid, vid3);
+    assert.equal(htmlCalls, 1, 'player page token list must be cached across episodes');
+    assert.deepEqual(fallbackCalls, [vid1, token1, vid3, token3]);
+  }],
+  ['Protected website SEO preview never replaces the complete App episode', () => withSourceOrder(['app', 'sdk', 'web', 'openhongguo'], async () => {
     const calls = [];
     let protectedPlayback = true, appAvailable = true;
     const f = load('hongguo.js', {
@@ -303,14 +506,14 @@ const checks = [
         post: async () => { calls.push('api'); return { status: 200, headers: {}, data: Buffer.alloc(0) }; },
       },
       './app-source': { fetchAppPlayUrl: async (_vid, options) => {
-        calls.push(options?.quality || 'app');
+        calls.push(options?.allowV8 === false ? 'sdk' : 'app');
         if (!appAvailable) throw new Error('unavailable');
         return { url: media('complete'), source: 'app' };
       } },
     });
     const result = await f.fetchPlayUrlSingle('11', '1');
     assert.equal(result.source, 'app', 'SEO duration describes the episode, not the public preview file');
-    assert.deepEqual(calls, ['web', 'app'], 'known preview must skip the redundant alternate page');
+    assert.deepEqual(calls, ['app'], 'known preview must not preempt the complete App episode');
     appAvailable = false; calls.length = 0;
     const unavailable = await f.fetchPlayUrlSingle('11', '1', { force: true });
     assert.equal(unavailable.code, 'SOURCE_UNAVAILABLE');
@@ -322,8 +525,8 @@ const checks = [
     assert.equal((await f.fetchPlayUrlSingle('11', '1', { force: true })).source, 'web', 'complete public web remains a valid recovery');
     appAvailable = true; calls.length = 0;
     assert.equal((await f.fetchPlayUrlSingle('11', '1', { quality: '1080p' })).source, 'app');
-    assert.deepEqual(calls, ['1080p'], 'explicit quality remains App-only');
-  }],
+    assert.deepEqual(calls, ['app'], 'explicit quality remains App-only');
+  })],
   ['Web accepts only an identity-bound VideoObject and ignores earlier recommended media', async () => {
     const unrelated = `<script type="application/ld+json">${JSON.stringify({ '@type': 'VideoObject', url: 'https://hongguoduanju.com/player/2/22', contentUrl: media('recommendation') })}</script>`;
     let html = unrelated + webPage();
@@ -404,15 +607,16 @@ const checks = [
     const result = await f.fetchAppPlayUrl('11');
     assert.ok(Array.isArray(result.variants), 'media candidates must survive address lookup');
     assert.deepEqual(Array.from(result.variants, v => v.url), ['main', 'backup', 'extra', 'hevc', 'list'].map(media));
+    const metadataCall = f.calls.findLast(call => ['model', 'metadata', 'legacy'].includes(appRoute(call)));
     for (const candidate of result.variants) {
       assert.equal(candidate.source, 'app'); assert.equal(candidate.vid, '11');
-      assert.equal(candidate.userAgent, f.calls[1].headers['User-Agent']);
+      assert.equal(candidate.userAgent, metadataCall.headers['User-Agent']);
       assert.equal(candidate.referer, undefined, 'App media must not start with the rejected website Referer');
       assert.equal(candidate.variants, undefined);
     }
     assert.equal(result.variants[2].contentKey, key1); assert.equal(result.variants[3].contentKey, key2);
-    assert.equal(result.variants[4].contentKey, null); assert.equal(f.calls.length, 2, 'no media preflight');
-    assert.deepEqual(f.calls.map(appRoute), ['model', 'metadata']);
+    assert.equal(result.variants[4].contentKey, null);
+    assert.deepEqual(f.calls.map(appRoute).filter(route => route !== 'videoTab'), ['model', 'metadata'], 'no media preflight');
   }],
   ['Strict quality alternatives never include smaller or unknown-size streams', async () => {
     const f = appFixture({ low: { main_url: media('low'), codec_type: 'h264', width: 720, height: 1280 },
@@ -428,20 +632,49 @@ const checks = [
     f.markWebMediaFailure(first); f.state.calls.length = 0;
     const recovered = await f.fetchPlayUrlSingle('11', '1', { force: true });
     assert.equal(recovered.source, 'web', 'five-minute penalty must not hide the only working source');
-    assert.deepEqual(f.state.calls, ['app', 'api', 'web']);
+    assert.deepEqual(f.state.calls, ['openhongguo', 'sdk', 'app', 'api', 'web']);
     f.state.app = true; f.state.calls.length = 0;
-    assert.equal((await f.fetchPlayUrlSingle('11', '1')).source, 'app');
-    assert.deepEqual(f.state.calls, ['app'], 'web penalty remains after last-resort recovery');
+    assert.equal((await f.fetchPlayUrlSingle('11', '1', { force: true })).source, 'app');
+    assert.deepEqual(f.state.calls.slice(0, 2), ['openhongguo', 'sdk'], 'the new default is attempted before App');
+    assert.ok(!f.state.calls.includes('web'), 'web penalty remains after last-resort recovery');
   }],
   ['Unavailable source reports safe per-route reasons without declaring web metadata a global block', async () => {
     const f = routeFixture(); f.state.web = false;
     const unavailable = await f.fetchPlayUrlSingle('11', '1');
     assert.equal(unavailable.code, 'SOURCE_UNAVAILABLE');
-    assert.deepEqual(Array.from(unavailable.sources, item => item.source), ['web', 'app', 'api']);
+    assert.deepEqual(Array.from(unavailable.sources, item => item.source), ['openhongguo', 'sdk', 'app', 'api', 'web']);
     assert.doesNotMatch(JSON.stringify(unavailable), /secret|signed\.invalid|private|前.*集|付费|会员/);
     assert.ok(unavailable.sources.every(item => item.code && item.message));
     f.state.app = true;
     assert.equal((await f.fetchPlayUrlSingle('11', '1')).source, 'app', 'failures must not be cached');
+  }],
+  ['User source priority controls App, SDK and web dispatch order', async () => {
+    const sourceOrder = require('../src/native/source-order');
+    try {
+      sourceOrder.setSourceOrder(['sdk', 'web', 'app']);
+      const f = routeFixture();
+      assert.equal((await f.fetchPlayUrlSingle('11', '1', { sdkPriority: true })).source, 'web');
+      assert.deepEqual(f.state.calls, ['sdk', 'web']);
+      assert.equal(f.state.sdkPriority, true);
+
+      sourceOrder.setSourceOrder(['web', 'app', 'sdk']);
+      const webFirst = routeFixture();
+      assert.equal((await webFirst.fetchPlayUrlSingle('11', '1')).source, 'web');
+      assert.deepEqual(webFirst.state.calls, ['web']);
+    } finally {
+      sourceOrder.setSourceOrder(['app', 'sdk', 'web']);
+    }
+  }],
+  ['Explicit quality moves the lower-quality web provider behind HD-capable providers', async () => {
+    const sourceOrder = require('../src/native/source-order');
+    try {
+      sourceOrder.setSourceOrder(['web', 'app', 'sdk', 'openhongguo']);
+      const f = routeFixture();
+      assert.equal((await f.fetchPlayUrlSingle('11', '1', { quality: '1080p', allowLowerQuality: true })).source, 'web');
+      assert.deepEqual(f.state.calls, ['app', 'api', 'sdk', 'openhongguo', 'web']);
+    } finally {
+      sourceOrder.setSourceOrder(['openhongguo', 'sdk', 'app', 'web']);
+    }
   }],
 ];
 (async () => {

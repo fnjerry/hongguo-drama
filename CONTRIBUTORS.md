@@ -1,7 +1,21 @@
-<!-- 7.9 source and release target; historical credits retained. -->
+<!-- 8.5 official release; historical credits retained. -->
 # 贡献者与问题反馈致谢
 
-7.9 延续公开贡献记录；感谢 [@xiaowangbb](https://github.com/xiaowangbb) 在 [#176](https://github.com/jackotom/hongguo-drama/issues/176) 与 [#177](https://github.com/jackotom/hongguo-drama/issues/177) 提供近千条任务、SMB 延迟、主进程 I/O 阻塞和发现页复现证据。详细署名与历史致谢保留在下方。
+## 8.5 社区反馈与方案致谢（2026-11-27）
+
+- **[@81199000](https://github.com/81199000)**：提交 [#217](https://github.com/jackotom/hongguo-drama/issues/217) 详尽分析官网 `vid_list` 变动及签名 App `video_detail/v1` 全集读取方案。
+- **[@13-shisan](https://github.com/13-shisan)**（[#215](https://github.com/jackotom/hongguo-drama/issues/215)）、**[@lonfund](https://github.com/lonfund)**（[#216](https://github.com/jackotom/hongguo-drama/issues/216)）：及时反馈双栈 Fake-IP 校验与兼容模式重复转码问题。
+
+## 8.3 / 8.4 社区取源与云端书架致谢（2026-11-26）
+
+- **[@beilunyang](https://github.com/beilunyang)**：提供开源项目 [beilunyang/openhongguo](https://github.com/beilunyang/openhongguo)，为本项目提供 `openhongguo` 社区 SDK 取源通道。
+- **[@xiaowangbb](https://github.com/xiaowangbb)**：提交 [PR #194](https://github.com/jackotom/hongguo-drama/pull/194) 支持读取红果账号官方收藏夹（云端书架），并长期反馈关键性能与稳定性问题（#176、#177、#193、#206）。
+
+8.0 延续公开贡献记录；感谢 #179 的多位用户及时提供空响应、无法在线播放和下载失败现象，感谢 #178 提供弹幕表情代码的显示需求。详细署名与历史致谢保留在下方。
+
+## 8.2 SDK 会话与批量取源致谢（2026-11-24）
+
+- **[@hoangnecon（Hoàng Nguyễn）](https://github.com/hoangnecon)**：提交 [PR #189](https://github.com/jackotom/hongguo-drama/pull/189)，提供 Windows SDK v5 helper、跨平台文件锁和 `--serve` 会话复用；提交 [PR #190](https://github.com/jackotom/hongguo-drama/pull/190)，提供数字下载队列的 8 集批量 SDK 取源、缓存与取消方案。两项提交已以真实 merge commit 合入 8.2 修复候选，并在保留现有 V8 优先架构、创作者合集内容类型和错误原因透传的基础上调整。
 
 ## 7.5 播放修复特别致谢（2026-11-16）
 
@@ -37,6 +51,7 @@
 | [@anupam-orbis](https://github.com/anupam-orbis) | [#140](https://github.com/jackotom/hongguo-drama/pull/140)（历史已核对，当前列表未返回，保留署名） |
 | [@alair-s](https://github.com/alair-s) | [#163](https://github.com/jackotom/hongguo-drama/pull/163)、[#164](https://github.com/jackotom/hongguo-drama/pull/164) |
 | [@ceco3000](https://github.com/ceco3000) | [#18](https://github.com/jackotom/hongguo-drama/pull/18) |
+| [@hoangnecon](https://github.com/hoangnecon) | [#189](https://github.com/jackotom/hongguo-drama/pull/189)、[#190](https://github.com/jackotom/hongguo-drama/pull/190) |
 | [@j2-cuong](https://github.com/j2-cuong) | [#159](https://github.com/jackotom/hongguo-drama/pull/159) |
 | [@jackotom](https://github.com/jackotom) | [#29](https://github.com/jackotom/hongguo-drama/pull/29)、[#88](https://github.com/jackotom/hongguo-drama/pull/88) |
 | [@jayeeliu](https://github.com/jayeeliu) | [#61](https://github.com/jackotom/hongguo-drama/pull/61) |

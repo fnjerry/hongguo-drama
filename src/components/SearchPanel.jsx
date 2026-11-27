@@ -27,15 +27,18 @@ function SearchPanel({ onSelectSeries, onViewSeries, onSwitchToInput, active = t
   const [historyError, setHistoryError] = useState('');
   const inputRef = useRef(null);
   useEffect(() => {
+    if (!active) return undefined;
     // Chromium's native datalist can stay at its old screen position after a container scroll.
-    const dismissSuggestions = () => inputRef.current?.blur();
+    const dismissSuggestions = () => {
+      if (typeof document === 'undefined' || document.activeElement === inputRef.current) inputRef.current?.blur();
+    };
     window.addEventListener('scroll', dismissSuggestions, true);
     window.addEventListener('resize', dismissSuggestions);
     return () => {
       window.removeEventListener('scroll', dismissSuggestions, true);
       window.removeEventListener('resize', dismissSuggestions);
     };
-  }, []);
+  }, [active]);
   const suggestions = getSearchSuggestions(keyword, history);
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null); // null=未搜索, []=无结果
@@ -232,7 +235,7 @@ function SearchPanel({ onSelectSeries, onViewSeries, onSwitchToInput, active = t
     setPickingId(item.series_id);
     setError('');
     try {
-      const res = await window.electronAPI.searchResolve(item.series_id);
+      const res = await window.electronAPI.searchResolve(item.series_id, { contentType: item.content_type });
       if (request !== requestVersion.current) return;
       if (res && res.success && res.data) {
         await (viewDetails ? onViewSeries : onSelectSeries)({

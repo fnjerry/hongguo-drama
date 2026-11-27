@@ -118,6 +118,8 @@ function mountPlayer(props, { api, softwareDecode = false, shortcuts } = {}) {
     './SequelFinder': 'SequelFinder',
     './NasDownload': 'NasDownload',
     './CastPanel': 'CastPanel',
+    './SeriesPicker': 'SeriesPicker',
+    './PlayerDialogs': 'PlayerDialogs',
     './VideoEnhancement': { default: 'VideoEnhancement', useVideoEnhancement: () => ({}) },
     './Player.css': {},
     './icons': Object.fromEntries(['Play', 'Film', 'Download', 'Check', 'RefreshCw', 'Layers', 'X', 'Trash2', 'ChevronDown', 'Zap'].map(name => [name, name])),
@@ -287,7 +289,7 @@ function mountSettings() {
       if (id === './useDialogKeyboard') return () => {};
       if (id === './Settings.css') return {};
       if (id === './icons') return Object.fromEntries(['Settings', 'Folder', 'Check', 'Globe', 'X', 'RefreshCw', 'AlertCircle'].map(name => [name, name]));
-      if (/^\.\/(?:AppearanceSettings|ShortcutSettings|StealthWakeRegion\.jsx|CustomSources|BuiltinSources|AnnouncementSettings)$/.test(id)) {
+      if (/^\.\/(?:AppearanceSettings|ShortcutSettings|StealthWakeRegion\.jsx|SourcePackSettings|CustomSources|BuiltinSources|AnnouncementSettings)$/.test(id)) {
         return { default: id.replace('./', '') };
       }
       throw new Error(`Unexpected import: ${id}`);
